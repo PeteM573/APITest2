@@ -40,3 +40,4 @@ This tool automates the process of identifying and extracting structured funding
 Install dependencies with:
 ```sh
 pip install -r requirements.txt
+```
