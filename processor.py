@@ -6,9 +6,14 @@ import json
 import csv
 import time
 from dotenv import load_dotenv  # NEW: Import the dotenv library
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
 
 # NEW: Load environment variables from a .env file
 load_dotenv() 
+
+processed_urls = set()
 
 # --- CONFIGURATION ---
 client = OpenAI(
@@ -20,41 +25,59 @@ client = OpenAI(
   },
 )
 
-def crawl_for_article_links(category_url, limit=5):
+# NEW, SELENIUM-POWERED CRAWLER FUNCTION
+def crawl_for_article_links(category_url, page=1):
     """
-    Crawls a TechCrunch category page to find links to individual articles.
+    Crawls a specific page of a TechCrunch category using a real browser
+    to handle JavaScript-based pagination.
     """
-    print(f"🕵️  Crawling for article links at: {category_url}")
+    full_url = f"{category_url}page/{page}/"
+    print(f"🕵️  Crawling with a browser on: {full_url}")
     links = []
+    
+    # Setup Chrome options to run in "headless" mode (no visible browser window)
+    options = webdriver.ChromeOptions()
+    options.add_argument('--headless')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    
+    driver = None  # Initialize driver to None
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(category_url, headers=headers)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'lxml')
+        # Initialize the Chrome driver automatically
+        driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
         
-        # --- THE FIX IS HERE ---
-        # We are now targeting the <a> tag directly with its specific class.
+        # Load the page
+        driver.get(full_url)
+        
+        # Give the JavaScript a moment to load the content
+        time.sleep(3) 
+        
+        # Get the page source *after* JavaScript has run
+        page_source = driver.page_source
+        
+        # Now, use BeautifulSoup on the JavaScript-rendered HTML
+        soup = BeautifulSoup(page_source, 'lxml')
+        
         for link_tag in soup.find_all('a', class_='loop-card__title-link'):
-            # The 'href' attribute contains the URL we want.
             if link_tag and 'href' in link_tag.attrs:
-                # Clean up any potential tracking parameters from the URL
                 clean_link = link_tag['href'].split('?')[0]
                 links.append(clean_link)
-                
-                # Stop once we've reached our limit
-                if len(links) >= limit:
-                    break
-                        
-        print(f"   -> Found {len(links)} article links.\n")
+        
+        print(f"   -> Found {len(links)} unique article links on this page.\n")
         return links
+
     except Exception as e:
-        print(f"   -> Error crawling for links: {e}")
+        print(f"   -> 🔴 Error crawling with Selenium: {e}")
         return []
+    finally:
+        # IMPORTANT: Always close the browser instance
+        if driver:
+            driver.quit()
 
 # --- SCRAPER FUNCTION (No changes here) ---
 def scrape_techcrunch_article(url):
-    """Scrapes the title and main content from a single TechCrunch article URL."""
-    print(f" Scraping URL: {url}\n")
+    """Scrapes the title, content, and a soup object from a TechCrunch article."""
+    print(f"  Scraping URL: {url}")
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers)
@@ -63,67 +86,90 @@ def scrape_techcrunch_article(url):
         title_tag = soup.find('title')
         title = title_tag.get_text().replace(' | TechCrunch', '').strip() if title_tag else "Title not found"
         content_div = soup.find('div', class_='entry-content')
-        if content_div:
-            paragraphs = content_div.find_all('p')
-            content = '\n'.join([p.get_text() for p in paragraphs])
-            return title, content
-        return title, "Content not found."
+        content = '\n'.join([p.get_text() for p in content_div.find_all('p')]) if content_div else "Content not found."
+        return title, content, soup # Return the soup object for our new function
     except Exception as e:
-        print(f"Error during scraping: {e}")
-        return None, None
+        print(f"   -> Error during scraping: {e}")
+        return None, None, None
+
+def is_climate_tech_startup(article_soup):
+    """
+    Checks if a startup is in the climate tech sector by scraping its own website.
+    Returns True if it's climate tech, False otherwise.
+    """
+    print("🔍 Final Check: Validating if startup is climate tech...")
+    try:
+        # Step 1: Find the startup's website from the article's first paragraph
+        first_p = article_soup.find('div', class_='entry-content').find('p')
+        startup_link_tag = first_p.find('a') if first_p else None
+
+        if not startup_link_tag or 'href' not in startup_link_tag.attrs:
+            print("   -> Could not find startup link in article. Assuming not climate tech.")
+            return False
+
+        startup_url = startup_link_tag['href']
+        
+        # Step 2: Scrape the startup's homepage
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(startup_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        startup_soup = BeautifulSoup(response.content, 'lxml')
+        
+        # Get all visible text from the body
+        startup_text = startup_soup.body.get_text(separator=' ', strip=True)[:1500]
+
+        # Step 3: Classify with AI
+        prompt = f"""You are a climate tech industry analyst. Based on the text from a company's website, is this a climate tech company?
+        
+        Climate tech includes sectors like: renewable energy, grid technology, electric vehicles (EVs), sustainable agriculture, carbon capture/removal, circular economy, climate adaptation, and industrial decarbonization.
+        
+        Answer with only YES or NO.
+
+        Website Text: "{startup_text}"
+        
+        Is this a climate tech company?
+        Answer:"""
+        
+        messages = [{"role": "user", "content": prompt}]
+        
+        ai_response = client.chat.completions.create(
+            model="mistralai/mistral-7b-instruct",
+            messages=messages,
+            temperature=0,
+            max_tokens=5
+        )
+        
+        decision = ai_response.choices[0].message.content.strip().upper()
+        print(f"   -> Startup validation result: {decision}")
+        return "YES" in decision
+
+    except Exception as e:
+        print(f"   -> 🔴 Error during startup validation: {e}. Assuming not climate tech.")
+        return False
 
 # --- AI FUNCTION 1: The Bouncer (No changes here) ---
-def classify_article_type(title, content_snippet):
-    """Uses AI to classify the article type to filter out irrelevant news."""
-    print("🤖 AI Step 1: Classifying article type...")
-    
-    prompt = f"""
-    Read the following article title and snippet. Is this article announcing that a *specific, named startup* has just raised a round of *private venture capital* (e.g., seed, Series A, B, C)?
-    
-    Answer with only one of these three categories:
-    1. STARTUP_FUNDING_ROUND
-    2. FUND_ANNOUNCEMENT (e.g., a VC announces a new fund)
-    3. GENERAL_NEWS (e.g., market analysis, IPO, opinion piece)
-
-    Title: {title}
-    Snippet: {content_snippet[:400]}
-    
-    Category:
-    """
-    
-    response = client.chat.completions.create(
-        model="qwen/qwen3-8b:free",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=100
-    )
-# UPGRADED "FEW-SHOT" CLASSIFIER WITH ENHANCED DEBUGGING
+# UPGRADED CLASSIFIER WITH A DIRECT COMMAND
 def classify_article_type(title, content_snippet):
     """
-    Uses AI to classify the article type with a few-shot prompt for better reliability.
+    Uses AI to classify the article type with a direct command to be concise.
     """
-    print("🤖 AI Step 1: Classifying article type (using few-shot prompt)...")
+    print("🤖 AI Step 1: Classifying article type (using direct command)...")
 
-    # This prompt now includes examples to guide the model.
-    prompt = f"""You are an expert AI assistant who classifies financial news. Your only job is to respond with one of three categories: STARTUP_FUNDING_ROUND, FUND_ANNOUNCEMENT, or GENERAL_NEWS.
+    # A more forceful prompt telling the model to be concise.
+    prompt = f"""You are a news classification AI. Your task is to classify an article into one of three categories. Do not explain your reasoning. Respond with ONLY the category name.
 
-Here are some examples:
+Categories: STARTUP_FUNDING_ROUND, FUND_ANNOUNCEMENT, GENERAL_NEWS.
 
----
 Example 1:
-Title: "Climate-tech startup Amogy raises $80M to power ships with ammonia"
-Snippet: "Amogy, a startup developing ammonia-based power solutions, announced today it has closed a Series C funding round of $80 million led by..."
+Title: "Amogy raises $80M to power ships with ammonia"
 Category: STARTUP_FUNDING_ROUND
----
+
 Example 2:
-Title: "How a new startup found an electrifying way to slash copper costs"
-Snippet: "A New Jersey-based company has developed a new manufacturing process that could revolutionize the copper industry by reducing waste and energy consumption..."
+Title: "How a startup found an electrifying way to slash copper costs"
 Category: GENERAL_NEWS
+
 ---
-
-Now, classify the following article:
-
-Article to classify:
+Classify this article:
 Title: "{title}"
 Snippet: "{content_snippet[:500]}"
 Category:"""
@@ -132,27 +178,26 @@ Category:"""
     
     try:
         response = client.chat.completions.create(
-            model="qwen/qwen3-8b:free",
+            # model="qwen/qwen3-8b:free",
+            model="mistralai/mistral-7b-instruct",
             messages=messages,
             temperature=0,
-            max_tokens=150
+            max_tokens=250 # A safe, generous budget.
         )
         
-        # --- ENHANCED LOGGING ---
-        # We will print the entire response object to see everything.
-        print(f"   -> 🔴 DEBUG: Full API response object: {response}")
-        # --- END LOGGING ---
-
         classification = response.choices[0].message.content.strip()
         
-        if not classification:
-             classification = "GENERAL_NEWS" # Default if the response is empty
+        if not classification or not any(cat in classification for cat in ["STARTUP_FUNDING_ROUND", "FUND_ANNOUNCEMENT", "GENERAL_NEWS"]):
+             print(f"   -> 🔴 DEBUG: Model returned an unexpected or empty classification: '{classification}'. Defaulting to GENERAL_NEWS.")
+             classification = "GENERAL_NEWS"
         
         print(f"   -> Classification result: {classification}\n")
         return classification
     except Exception as e:
         print(f"   -> 🔴 ERROR during classification: {e}. Defaulting to GENERAL_NEWS.")
         return "GENERAL_NEWS"
+
+
 
 # --- AI FUNCTION 2: The Miner (No changes here) ---
 def extract_funding_data(content):
@@ -171,7 +216,8 @@ def extract_funding_data(content):
     """
 
     response = client.chat.completions.create(
-        model="qwen/qwen3-8b:free", # OpenRouter uses model names directly
+        # model="qwen/qwen3-8b:free", # OpenRouter uses model names directly
+        model="meta-llama/llama-3-8b-instruct",
         response_format={"type": "json_object"},
         messages=[{"role": "user", "content": prompt}]
     )
@@ -206,63 +252,68 @@ def save_to_csv(data_list, filename="funding_data.csv"):
         dict_writer.writerows(data_list)
         
     print("   -> Save complete.")
-# REVISED MAIN ORCHESTRATOR
 if __name__ == "__main__":
-    TECHCRUNCH_CLIMATE_URL = "https://techcrunch.com/category/climate/"
+    TECHCRUNCH_VENTURE_URL = "https://techcrunch.com/category/venture/"
     
-    # --- NEW LOOP CONFIGURATION ---
-    TARGET_SUCCESSES = 3  # Let's aim to find 3 good articles
-    CRAWL_LIMIT = 15      # We'll crawl up to 15 links to find them
-    
-    print(f"🎯 Goal: Find {TARGET_SUCCESSES} new funding events. Will crawl up to {CRAWL_LIMIT} articles.")
+    TARGET_SUCCESSES = 5   # Let's aim for 5 pure climate tech funding events
+    MAX_PAGES_TO_CRAWL = 10  # Safety limit to avoid infinite loops
 
-    # 1. Crawl for a generous number of links
-    article_urls = crawl_for_article_links(TECHCRUNCH_CLIMATE_URL, limit=CRAWL_LIMIT)
-    
+    print(f"🎯 Goal: Find {TARGET_SUCCESSES} new CLIMATE TECH funding events. Will crawl up to {MAX_PAGES_TO_CRAWL} pages.")
+
     all_funding_data = []
-    url_index = 0
+    current_page = 1
 
-    # 2. Use a WHILE loop to process links until we hit our target or run out of links
-    while len(all_funding_data) < TARGET_SUCCESSES and url_index < len(article_urls):
-        url = article_urls[url_index]
-        
-        print(f"--- Processing URL {url_index + 1}/{len(article_urls)} | Successes {len(all_funding_data)}/{TARGET_SUCCESSES} ---")
-        
-        title, content = scrape_techcrunch_article(url)
-        url_index += 1 # Increment index immediately to ensure we always move forward
-        
-        if not title or not content:
-            print("   -> Skipping article due to scraping error.\n")
-            time.sleep(1)
-            continue
+    while len(all_funding_data) < TARGET_SUCCESSES and current_page <= MAX_PAGES_TO_CRAWL:
+        print(f"\n--- Crawling Page {current_page} ---")
+        article_urls = crawl_for_article_links(TECHCRUNCH_VENTURE_URL, page=current_page)
 
-        article_type = classify_article_type(title, content)
-        
-        if "STARTUP_FUNDING_ROUND" in article_type:
-            # This is a good one! Process it.
-            paragraphs = content.strip().split('\n')
-            if len(paragraphs) > 6:
-                optimized_content = "\n".join(paragraphs[:3]) + "\n...\n" + "\n".join(paragraphs[-3:])
+        if not article_urls:
+            print("   -> No more articles found on this page. Ending process.")
+            break
+
+        for url in article_urls:
+
+            if url in processed_urls:
+                continue # Skip this URL, we've already processed it.
+    
+             # Add the URL to our set so we don't process it again
+            processed_urls.add(url)
+                # --- END FIX ---
+            print(f"\n--- Processing URL: {url} | Successes: {len(all_funding_data)}/{TARGET_SUCCESSES} ---")
+            
+            title, content, soup = scrape_techcrunch_article(url)
+            
+            if not title or not content or not soup:
+                continue
+
+            article_type = classify_article_type(title, content)
+            
+            if "STARTUP_FUNDING_ROUND" in article_type:
+                funding_data = extract_funding_data(content)
+                
+                if funding_data and funding_data.get('startup_name'):
+                    # This is our final, crucial filter
+                    if is_climate_tech_startup(soup):
+                        funding_data['source_url'] = url 
+                        all_funding_data.append(funding_data)
+                        print("   -> ✅✅✅ SUCCESS: CLIMATE TECH funding event found and saved!\n")
+                        # If we hit our target, we can stop
+                        if len(all_funding_data) >= TARGET_SUCCESSES:
+                            break
+                    else:
+                        print("   -> ❌ SKIPPED: Startup is not climate tech.\n")
+                else:
+                    print("   -> ❌ SKIPPED: AI failed to extract startup name.\n")
             else:
-                optimized_content = content
+                print("   -> ❌ SKIPPED: Article is not a funding announcement.\n")
             
-            funding_data = extract_funding_data(optimized_content)
-            
-            if funding_data:
-                funding_data['source_url'] = url 
-                all_funding_data.append(funding_data) # Add to our success list
-                print("   -> ✅ SUCCESS: Data extracted and added to collection.\n")
-        else:
-            # This one is irrelevant. The loop will continue.
-            print("   -> ❌ SKIPPED: Article classified as irrelevant.\n")
+            time.sleep(3.1)
         
-        print("   -> Pausing for 3.1 seconds to respect rate limit...")
-        time.sleep(3.1)
+        current_page += 1
+        
+        # Break the outer loop if we're already done
+        if len(all_funding_data) >= TARGET_SUCCESSES:
+            break
 
-    # 3. Save all the collected data to a file
-    if all_funding_data:
-        save_to_csv(all_funding_data)
-    else:
-        print("🏁 Process finished. No new funding data was found in the crawled articles.")
-
+    save_to_csv(all_funding_data, filename="climate_funding_data.csv")
     print("🏁 Full process complete.")
